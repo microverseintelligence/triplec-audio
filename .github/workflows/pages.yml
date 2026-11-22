@@ -1,0 +1,71 @@
+name: Build Triple C audio mirror
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Cache audio
+        uses: actions/cache@v4
+        with:
+          path: dist/km
+          key: km-${{ hashFiles('km_sources.json') }}
+          restore-keys: km-
+      - name: Fetch and transcode (MP3 128 kbps)
+        run: |
+          set -e
+          mkdir -p dist/km tmp_src
+          python3 - <<'PY'
+          import json, os, subprocess, urllib.request, time
+          from concurrent.futures import ThreadPoolExecutor
+          items = json.load(open('km_sources.json'))
+          keep = {f"{it['id']}.mp3" for it in items}
+          for f in os.listdir('dist/km'):
+              if f not in keep: os.remove(os.path.join('dist/km', f))
+          def run(it):
+              out = f"dist/km/{it['id']}.mp3"
+              if os.path.exists(out) and os.path.getsize(out) > 10000:
+                  return it['id'], 'cached'
+              src = f"tmp_src/{it['id']}.mp3"
+              for url in it['urls']:
+                  for attempt in range(3):
+                      try:
+                          req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (TripleC build)'})
+                          data = urllib.request.urlopen(req, timeout=240).read()
+                          if len(data) < 50000: raise ValueError('too small')
+                          open(src, 'wb').write(data)
+                          subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', src, '-map', '0:a', '-map_metadata', '-1', '-ac', '2', '-ar', '44100', '-b:a', '128k', out], check=True)
+                          return it['id'], 'ok'
+                      except Exception as e:
+                          time.sleep(4 * (attempt + 1))
+              return it['id'], 'failed'
+          res = list(ThreadPoolExecutor(8).map(run, items))
+          bad = [r for r in res if r[1] == 'failed']
+          print('audio:', len(res) - len(bad), 'ok,', len(bad), 'failed', bad)
+          if len(bad) > 5:
+              raise SystemExit('too many audio failures')
+          PY
+          du -sh dist/km
+          ls dist/km | wc -l
+      - name: Site files
+        run: |
+          cp index.html dist/ && touch dist/.nojekyll
+      - name: Publish to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+          publish_branch: gh-pages
+          force_orphan: true
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
